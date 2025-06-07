@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Any, Callable, List, NamedTuple, Optional
 
 import aiohttp
+import httpx
 from asgiref.sync import sync_to_async
-from httpx import RemoteProtocolError
 from tenacity import (
     before_sleep_log,
     retry,
@@ -20,7 +20,7 @@ from tenacity import (
 )
 
 from khoj.database.adapters import FileObjectAdapters
-from khoj.database.models import Agent, FileObject, KhojUser
+from khoj.database.models import Agent, ChatMessageModel, FileObject, KhojUser
 from khoj.processor.conversation import prompts
 from khoj.processor.conversation.utils import (
     ChatEvent,
@@ -50,7 +50,7 @@ class GeneratedCode(NamedTuple):
 
 async def run_code(
     query: str,
-    conversation_history: dict,
+    conversation_history: List[ChatMessageModel],
     context: str,
     location_data: LocationData,
     user: KhojUser,
@@ -116,7 +116,7 @@ async def run_code(
 
 async def generate_python_code(
     q: str,
-    conversation_history: dict,
+    chat_history: List[ChatMessageModel],
     context: str,
     location_data: LocationData,
     user: KhojUser,
@@ -127,7 +127,7 @@ async def generate_python_code(
 ) -> GeneratedCode:
     location = f"{location_data}" if location_data else "Unknown"
     username = prompts.user_name.format(name=user.get_full_name()) if user.get_full_name() else ""
-    chat_history = construct_chat_history(conversation_history)
+    chat_history_str = construct_chat_history(chat_history)
 
     utc_date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
     personality_context = (
@@ -143,7 +143,7 @@ async def generate_python_code(
 
     code_generation_prompt = prompts.python_code_generation_prompt.format(
         query=q,
-        chat_history=chat_history,
+        chat_history=chat_history_str,
         context=context,
         has_network_access=network_access_context,
         current_date=utc_date,
@@ -161,7 +161,7 @@ async def generate_python_code(
     )
 
     # Extract python code wrapped in markdown code blocks from the response
-    code_blocks = re.findall(r"```(?:python)?\n(.*?)\n```", response, re.DOTALL)
+    code_blocks = re.findall(r"```(?:python)?\n(.*?)```", response, re.DOTALL)
 
     if not code_blocks:
         raise ValueError("No Python code blocks found in response")
@@ -192,7 +192,9 @@ async def generate_python_code(
         | retry_if_exception_type(aiohttp.ClientTimeout)
         | retry_if_exception_type(asyncio.TimeoutError)
         | retry_if_exception_type(ConnectionError)
-        | retry_if_exception_type(RemoteProtocolError)
+        | retry_if_exception_type(httpx.RemoteProtocolError)
+        | retry_if_exception_type(httpx.NetworkError)
+        | retry_if_exception_type(httpx.TimeoutException)
     ),
     wait=wait_random_exponential(min=1, max=5),
     stop=stop_after_attempt(3),
@@ -244,6 +246,7 @@ async def execute_e2b(code: str, input_files: list[dict]) -> dict[str, Any]:
 
         # Collect output files
         output_files = []
+        image_file_ext = {".png", ".jpeg", ".jpg", ".svg"}
 
         # Identify new files created during execution
         new_files = set(E2bFile(f.name, f.path) for f in await sandbox.files.list("~")) - original_files
@@ -254,7 +257,7 @@ async def execute_e2b(code: str, input_files: list[dict]) -> dict[str, Any]:
             if isinstance(content, bytes):
                 # Binary files like PNG - encode as base64
                 b64_data = base64.b64encode(content).decode("utf-8")
-            elif Path(f.name).suffix in [".png", ".jpeg", ".jpg", ".svg"]:
+            elif Path(f.name).suffix in image_file_ext:
                 # Ignore image files as they are extracted from execution results below for inline display
                 continue
             else:
@@ -263,8 +266,12 @@ async def execute_e2b(code: str, input_files: list[dict]) -> dict[str, Any]:
             output_files.append({"filename": f.name, "b64_data": b64_data})
 
         # Collect output files from execution results
+        # Repect ordering of output result types to disregard text output associated with images
+        output_result_types = ["png", "jpeg", "svg", "text", "markdown", "json"]
         for idx, result in enumerate(execution.results):
-            for result_type in {"png", "jpeg", "svg", "text", "markdown", "json"}:
+            if getattr(result, "chart", None):
+                continue
+            for result_type in output_result_types:
                 if b64_data := getattr(result, result_type, None):
                     output_files.append({"filename": f"{idx}.{result_type}", "b64_data": b64_data})
                     break
