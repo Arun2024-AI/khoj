@@ -31,6 +31,8 @@ import {
     Shapes,
     Trash,
     Toolbox,
+    Browser,
+    ArrowClockwise,
 } from "@phosphor-icons/react";
 
 import DOMPurify from "dompurify";
@@ -127,7 +129,7 @@ export interface CodeContextData {
         output_files: CodeContextFile[];
         std_out: string;
         std_err: string;
-        code_runtime: number;
+        code_runtime?: number;
     };
 }
 
@@ -143,7 +145,7 @@ interface Intent {
     "inferred-queries": string[];
 }
 
-interface TrainOfThoughtObject {
+export interface TrainOfThoughtObject {
     type: string;
     data: string;
 }
@@ -272,6 +274,7 @@ interface ChatMessageProps {
     isLastMessage?: boolean;
     agent?: AgentData;
     onDeleteMessage: (turnId?: string) => void;
+    onRetryMessage?: (query: string, turnId?: string) => void;
     conversationId: string;
     turnId?: string;
     generatedImage?: string;
@@ -333,6 +336,10 @@ function chooseIconFromHeader(header: string, iconColor: string) {
         return <Code className={`${classNames}`} />;
     }
 
+    if (compareHeader.includes("operating")) {
+        return <Browser className={`${classNames}`} />;
+    }
+
     return <Brain className={`${classNames}`} />;
 }
 
@@ -342,10 +349,32 @@ export function TrainOfThought(props: TrainOfThoughtProps) {
     let header = extractedHeader ? extractedHeader[1] : "";
     const iconColor = props.primary ? convertColorToTextClass(props.agentColor) : "text-gray-500";
     const icon = chooseIconFromHeader(header, iconColor);
-    let markdownRendered = DOMPurify.sanitize(md.render(props.message));
+    let message = props.message;
 
-    // Remove any header tags from markdownRendered
+    // Render screenshot image in screenshot action message
+    let jsonMessage = null;
+    try {
+        const jsonMatch = message.match(
+            /\{.*("action": "screenshot"|"type": "screenshot"|"image": "data:image\/.*").*\}/,
+        );
+        if (jsonMatch) {
+            jsonMessage = JSON.parse(jsonMatch[0]);
+            const screenshotHtmlString = `<img src="${jsonMessage.image}" alt="State of environment" class="max-w-full" />`;
+            message = message.replace(
+                `:\n**Action**: ${jsonMatch[0]}`,
+                `\n\n- ${jsonMessage.text}\n${screenshotHtmlString}`,
+            );
+        }
+    } catch (e) {
+        console.error("Failed to parse screenshot data", e);
+    }
+
+    // Render the sanitized train of thought as markdown
+    let markdownRendered = DOMPurify.sanitize(md.render(message));
+
+    // Remove any header tags from the rendered markdown
     markdownRendered = markdownRendered.replace(/<h[1-6].*?<\/h[1-6]>/g, "");
+
     return (
         <div
             className={`${styles.trainOfThoughtElement} break-words items-center ${props.primary ? "text-gray-400" : "text-gray-300"} ${styles.trainOfThought} ${props.primary ? styles.primary : ""}`}
@@ -425,7 +454,7 @@ const ChatMessage = forwardRef<HTMLDivElement, ChatMessageProps>((props, ref) =>
         // Add code context files to the message
         if (props.chatMessage.codeContext) {
             Object.entries(props.chatMessage.codeContext).forEach(([key, value]) => {
-                value.results.output_files?.forEach((file) => {
+                value.results?.output_files?.forEach((file) => {
                     if (file.filename.endsWith(".png") || file.filename.endsWith(".jpg")) {
                         // Don't add the image again if it's already in the message!
                         if (!message.includes(`![${file.filename}](`)) {
@@ -784,6 +813,38 @@ const ChatMessage = forwardRef<HTMLDivElement, ChatMessageProps>((props, ref) =>
                                     <Trash
                                         alt="Delete Message"
                                         className="hsl(var(--muted-foreground)) hover:text-red-500"
+                                    />
+                                </button>
+                            )}
+                            {props.chatMessage.by === "khoj" && props.onRetryMessage && props.isLastMessage && (
+                                <button
+                                    title="Retry"
+                                    className={`${styles.retryButton}`}
+                                    onClick={() => {
+                                        const turnId = props.chatMessage.turnId || props.turnId;
+                                        const query = props.chatMessage.rawQuery || props.chatMessage.intent?.query;
+                                        console.log("Retry button clicked for turnId:", turnId);
+                                        console.log("ChatMessage data:", {
+                                            rawQuery: props.chatMessage.rawQuery,
+                                            intent: props.chatMessage.intent,
+                                            message: props.chatMessage.message
+                                        });
+                                        console.log("Extracted query:", query);
+                                        if (query) {
+                                            props.onRetryMessage?.(query, turnId);
+                                        } else {
+                                            console.error("No original query found for retry");
+                                            // Fallback: try to get from a previous user message or show an input dialog
+                                            const fallbackQuery = prompt("Enter the original query to retry:");
+                                            if (fallbackQuery) {
+                                                props.onRetryMessage?.(fallbackQuery, turnId);
+                                            }
+                                        }
+                                    }}
+                                >
+                                    <ArrowClockwise
+                                        alt="Retry Message"
+                                        className="hsl(var(--muted-foreground)) hover:text-blue-500"
                                     />
                                 </button>
                             )}

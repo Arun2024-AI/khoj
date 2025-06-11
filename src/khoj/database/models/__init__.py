@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 class Context(PydanticBaseModel):
     compiled: str
     file: str
+    query: Optional[str] = None
 
 
 class CodeContextFile(PydanticBaseModel):
@@ -35,12 +36,12 @@ class CodeContextResult(PydanticBaseModel):
     output_files: List[CodeContextFile]
     std_out: str
     std_err: str
-    code_runtime: int
+    code_runtime: Optional[int] = None
 
 
 class CodeContextData(PydanticBaseModel):
     code: str
-    result: Optional[CodeContextResult] = None
+    results: Optional[CodeContextResult] = None
 
 
 class WebPage(PydanticBaseModel):
@@ -84,13 +85,13 @@ class OnlineContext(PydanticBaseModel):
     answerBox: Optional[AnswerBox] = None
     peopleAlsoAsk: Optional[List[PeopleAlsoAsk]] = None
     knowledgeGraph: Optional[KnowledgeGraph] = None
-    organicContext: Optional[List[OrganicContext]] = None
+    organic: Optional[List[OrganicContext]] = None
 
 
 class Intent(PydanticBaseModel):
     type: str
-    query: str
-    memory_type: str = Field(alias="memory-type")
+    query: Optional[str] = None
+    memory_type: Optional[str] = Field(alias="memory-type", default=None)
     inferred_queries: Optional[List[str]] = Field(default=None, alias="inferred-queries")
 
 
@@ -99,18 +100,20 @@ class TrainOfThought(PydanticBaseModel):
     data: str
 
 
-class ChatMessage(PydanticBaseModel):
-    message: str
+class ChatMessageModel(PydanticBaseModel):
+    by: str
+    message: str | list[dict]
     trainOfThought: List[TrainOfThought] = []
     context: List[Context] = []
     onlineContext: Dict[str, OnlineContext] = {}
     codeContext: Dict[str, CodeContextData] = {}
-    created: str
+    researchContext: Optional[List] = None
+    operatorContext: Optional[List] = None
+    created: Optional[str] = None
     images: Optional[List[str]] = None
     queryFiles: Optional[List[Dict]] = None
     excalidrawDiagram: Optional[List[Dict]] = None
-    mermaidjsDiagram: str = None
-    by: str
+    mermaidjsDiagram: Optional[str] = None
     turnId: Optional[str] = None
     intent: Optional[Intent] = None
     automationId: Optional[str] = None
@@ -134,7 +137,7 @@ class ClientApplication(DbBaseModel):
 
 
 class KhojUser(AbstractUser):
-    uuid = models.UUIDField(models.UUIDField(default=uuid.uuid4, editable=False))
+    uuid = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
     phone_number = PhoneNumberField(null=True, default=None, blank=True)
     verified_phone_number = models.BooleanField(default=False)
     verified_email = models.BooleanField(default=False)
@@ -195,6 +198,11 @@ class AiModelApi(DbBaseModel):
         return self.name
 
 
+class PriceTier(models.TextChoices):
+    FREE = "free"
+    STANDARD = "standard"
+
+
 class ChatModel(DbBaseModel):
     class ModelType(models.TextChoices):
         OPENAI = "openai"
@@ -207,6 +215,7 @@ class ChatModel(DbBaseModel):
     tokenizer = models.CharField(max_length=200, default=None, null=True, blank=True)
     name = models.CharField(max_length=200, default="bartowski/Meta-Llama-3.1-8B-Instruct-GGUF")
     model_type = models.CharField(max_length=200, choices=ModelType.choices, default=ModelType.OFFLINE)
+    price_tier = models.CharField(max_length=20, choices=PriceTier.choices, default=PriceTier.FREE)
     vision_enabled = models.BooleanField(default=False)
     ai_model_api = models.ForeignKey(AiModelApi, on_delete=models.CASCADE, default=None, null=True, blank=True)
     description = models.TextField(default=None, null=True, blank=True)
@@ -219,6 +228,7 @@ class ChatModel(DbBaseModel):
 class VoiceModelOption(DbBaseModel):
     model_id = models.CharField(max_length=200)
     name = models.CharField(max_length=200)
+    price_tier = models.CharField(max_length=20, choices=PriceTier.choices, default=PriceTier.STANDARD)
 
 
 class Agent(DbBaseModel):
@@ -452,6 +462,17 @@ class ServerChatSettings(DbBaseModel):
         WebScraper, on_delete=models.CASCADE, default=None, null=True, blank=True, related_name="web_scraper"
     )
 
+    def clean(self):
+        error = {}
+        if self.chat_default and self.chat_default.price_tier != PriceTier.FREE:
+            error["chat_default"] = "Set the price tier of this chat model to free or use a free tier chat model."
+        if error:
+            raise ValidationError(error)
+
+    def save(self, *args, **kwargs):
+        self.clean()
+        super().save(*args, **kwargs)
+
 
 class LocalOrgConfig(DbBaseModel):
     input_files = models.JSONField(default=list, null=True)
@@ -534,6 +555,7 @@ class TextToImageModelConfig(DbBaseModel):
 
     model_name = models.CharField(max_length=200, default="dall-e-3")
     model_type = models.CharField(max_length=200, choices=ModelType.choices, default=ModelType.OPENAI)
+    price_tier = models.CharField(max_length=20, choices=PriceTier.choices, default=PriceTier.FREE)
     api_key = models.CharField(max_length=200, default=None, null=True, blank=True)
     ai_model_api = models.ForeignKey(AiModelApi, on_delete=models.CASCADE, default=None, null=True, blank=True)
 
@@ -571,6 +593,7 @@ class SpeechToTextModelOptions(DbBaseModel):
 
     model_name = models.CharField(max_length=200, default="base")
     model_type = models.CharField(max_length=200, choices=ModelType.choices, default=ModelType.OFFLINE)
+    price_tier = models.CharField(max_length=20, choices=PriceTier.choices, default=PriceTier.FREE)
     ai_model_api = models.ForeignKey(AiModelApi, on_delete=models.CASCADE, default=None, null=True, blank=True)
 
     def __str__(self):
@@ -611,7 +634,7 @@ class Conversation(DbBaseModel):
         try:
             messages = self.conversation_log.get("chat", [])
             for msg in messages:
-                ChatMessage.model_validate(msg)
+                ChatMessageModel.model_validate(msg)
         except Exception as e:
             raise ValidationError(f"Invalid conversation_log format: {str(e)}")
 
@@ -620,7 +643,7 @@ class Conversation(DbBaseModel):
         super().save(*args, **kwargs)
 
     @property
-    def messages(self) -> List[ChatMessage]:
+    def messages(self) -> List[ChatMessageModel]:
         """Type-hinted accessor for conversation messages"""
         validated_messages = []
         for msg in self.conversation_log.get("chat", []):
@@ -631,7 +654,7 @@ class Conversation(DbBaseModel):
                         q for q in msg["intent"]["inferred-queries"] if q is not None and isinstance(q, str)
                     ]
                 msg["message"] = str(msg.get("message", ""))
-                validated_messages.append(ChatMessage.model_validate(msg))
+                validated_messages.append(ChatMessageModel.model_validate(msg))
             except ValidationError as e:
                 logger.warning(f"Skipping invalid message in conversation: {e}")
                 continue
@@ -730,8 +753,26 @@ class EntryDates(DbBaseModel):
 
 
 class UserRequests(DbBaseModel):
+    """Stores user requests to the server for rate limiting."""
+
     user = models.ForeignKey(KhojUser, on_delete=models.CASCADE)
     slug = models.CharField(max_length=200)
+
+
+class RateLimitRecord(DbBaseModel):
+    """Stores individual request timestamps for rate limiting."""
+
+    identifier = models.CharField(max_length=255, db_index=True)  # IP address or email
+    slug = models.CharField(max_length=255, db_index=True)  # Differentiates limit types
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["identifier", "slug", "created_at"]),
+        ]
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.slug} - {self.identifier} at {self.created_at}"
 
 
 class DataStore(DbBaseModel):

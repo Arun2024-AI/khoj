@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import os
-import urllib.parse
 from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
@@ -11,7 +10,13 @@ from bs4 import BeautifulSoup
 from markdownify import markdownify
 
 from khoj.database.adapters import ConversationAdapters
-from khoj.database.models import Agent, KhojUser, ServerChatSettings, WebScraper
+from khoj.database.models import (
+    Agent,
+    ChatMessageModel,
+    KhojUser,
+    ServerChatSettings,
+    WebScraper,
+)
 from khoj.processor.conversation import prompts
 from khoj.routers.helpers import (
     ChatEvent,
@@ -33,7 +38,7 @@ logger = logging.getLogger(__name__)
 GOOGLE_SEARCH_API_KEY = os.getenv("GOOGLE_SEARCH_API_KEY")
 GOOGLE_SEARCH_ENGINE_ID = os.getenv("GOOGLE_SEARCH_ENGINE_ID")
 SERPER_DEV_API_KEY = os.getenv("SERPER_DEV_API_KEY")
-AUTO_READ_WEBPAGE = is_env_var_true("AUTO_READ_WEBPAGE")
+AUTO_READ_WEBPAGE = is_env_var_true("KHOJ_AUTO_READ_WEBPAGE")
 SERPER_DEV_URL = "https://google.serper.dev/search"
 
 JINA_SEARCH_API_URL = "https://s.jina.ai/"
@@ -60,16 +65,17 @@ OLOSTEP_QUERY_PARAMS = {
 
 async def search_online(
     query: str,
-    conversation_history: dict,
+    conversation_history: List[ChatMessageModel],
     location: LocationData,
     user: KhojUser,
     send_status_func: Optional[Callable] = None,
     custom_filters: List[str] = [],
+    max_online_searches: int = 3,
     max_webpages_to_read: int = 1,
     query_images: List[str] = None,
+    query_files: str = None,
     previous_subqueries: Set = set(),
     agent: Agent = None,
-    query_files: str = None,
     tracer: dict = {},
 ):
     query += " ".join(custom_filters)
@@ -85,9 +91,10 @@ async def search_online(
         location,
         user,
         query_images=query_images,
+        query_files=query_files,
+        max_queries=max_online_searches,
         agent=agent,
         tracer=tracer,
-        query_files=query_files,
     )
     subqueries = list(new_subqueries - previous_subqueries)
     response_dict: Dict[str, Dict[str, List[Dict] | Dict]] = {}
@@ -113,7 +120,6 @@ async def search_online(
     search_engine = "Searxng"
     search_engines.append((search_engine, search_with_searxng))
 
-    logger.info(f"🌐 Searching the Internet for {subqueries}")
     if send_status_func:
         subqueries_str = "\n- " + "\n- ".join(subqueries)
         async for event in send_status_func(f"**Searching the Internet for**: {subqueries_str}"):
@@ -121,6 +127,7 @@ async def search_online(
 
     response_dict = {}
     for search_engine, search_func in search_engines:
+        logger.info(f"🌐 Searching the Internet with {search_engine} for {subqueries}")
         with timer(f"Internet searches with {search_engine} for {subqueries} took", logger):
             try:
                 search_tasks = [search_func(subquery, location) for subquery in subqueries]
@@ -360,7 +367,7 @@ async def search_with_serper(query: str, location: LocationData) -> Tuple[str, D
 
 async def read_webpages(
     query: str,
-    conversation_history: dict,
+    conversation_history: List[ChatMessageModel],
     location: LocationData,
     user: KhojUser,
     send_status_func: Optional[Callable] = None,
@@ -500,7 +507,7 @@ async def read_webpage_with_jina(web_url: str, api_key: str, api_url: str) -> st
 async def read_webpage_with_firecrawl(web_url: str, api_key: str, api_url: str) -> str:
     firecrawl_api_url = f"{api_url}/v1/scrape"
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-    params = {"url": web_url, "formats": ["markdown"], "excludeTags": ["script", ".ad"]}
+    params = {"url": web_url, "formats": ["markdown"], "excludeTags": ["script", ".ad"], "removeBase64Images": True}
 
     async with aiohttp.ClientSession() as session:
         async with session.post(firecrawl_api_url, json=params, headers=headers) as response:

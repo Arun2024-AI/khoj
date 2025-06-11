@@ -24,9 +24,7 @@ import {
     ChatOptions,
 } from "../components/chatInputArea/chatInputArea";
 import { useAuthenticatedData } from "../common/auth";
-import {
-    AgentData,
-} from "@/app/components/agentCard/agentCard";
+import { AgentData } from "@/app/components/agentCard/agentCard";
 import { ChatSessionActionMenu } from "../components/allConversations/allConversations";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { AppSidebar } from "../components/appSidebar/appSidebar";
@@ -50,6 +48,9 @@ interface ChatBodyDataProps {
     setTriggeredAbort: (triggeredAbort: boolean) => void;
     isChatSideBarOpen: boolean;
     setIsChatSideBarOpen: (open: boolean) => void;
+    isActive?: boolean;
+    isParentProcessing?: boolean;
+    onRetryMessage?: (query: string, turnId?: string) => void;
 }
 
 function ChatBodyData(props: ChatBodyDataProps) {
@@ -157,6 +158,7 @@ function ChatBodyData(props: ChatBodyDataProps) {
                         setIncomingMessages={props.setStreamedMessages}
                         customClassName={chatHistoryCustomClassName}
                         setIsChatSideBarOpen={props.setIsChatSideBarOpen}
+                        onRetryMessage={props.onRetryMessage}
                     />
                 </div>
                 <div
@@ -167,7 +169,7 @@ function ChatBodyData(props: ChatBodyDataProps) {
                         isLoggedIn={props.isLoggedIn}
                         sendMessage={(message) => setMessage(message)}
                         sendImage={(image) => setImages((prevImages) => [...prevImages, image])}
-                        sendDisabled={processingMessage}
+                        sendDisabled={props.isParentProcessing || false}
                         chatOptionsData={props.chatOptionsData}
                         conversationId={conversationId}
                         isMobileWidth={props.isMobileWidth}
@@ -180,9 +182,11 @@ function ChatBodyData(props: ChatBodyDataProps) {
             </div>
             <ChatSidebar
                 conversationId={conversationId}
+                isActive={props.isActive}
                 isOpen={props.isChatSideBarOpen}
                 onOpenChange={props.setIsChatSideBarOpen}
-                isMobileWidth={props.isMobileWidth} />
+                isMobileWidth={props.isMobileWidth}
+            />
         </div>
     );
 }
@@ -202,6 +206,7 @@ export default function Chat() {
     const [abortMessageStreamController, setAbortMessageStreamController] =
         useState<AbortController | null>(null);
     const [triggeredAbort, setTriggeredAbort] = useState(false);
+    const [shouldSendWithInterrupt, setShouldSendWithInterrupt] = useState(false);
 
     const { locationData, locationDataError, locationDataLoading } = useIPLocationData() || {
         locationData: {
@@ -238,10 +243,10 @@ export default function Chat() {
         if (triggeredAbort) {
             abortMessageStreamController?.abort();
             handleAbortedMessage();
+            setShouldSendWithInterrupt(true);
             setTriggeredAbort(false);
         }
-    }),
-        [triggeredAbort];
+    }, [triggeredAbort]);
 
     useEffect(() => {
         if (queryToProcess) {
@@ -335,18 +340,21 @@ export default function Chat() {
 
         currentMessage.completed = true;
         setMessages([...messages]);
-        setQueryToProcess("");
         setProcessQuerySignal(false);
     }
 
     async function chat() {
         localStorage.removeItem("message");
-        if (!queryToProcess || !conversationId) return;
+        if (!queryToProcess || !conversationId) {
+            setProcessQuerySignal(false);
+            return;
+        }
         const chatAPI = "/api/chat?client=web";
         const chatAPIBody = {
             q: queryToProcess,
             conversation_id: conversationId,
             stream: true,
+            interrupt: shouldSendWithInterrupt,
             ...(locationData && {
                 city: locationData.city,
                 region: locationData.region,
@@ -357,6 +365,9 @@ export default function Chat() {
             ...(images.length > 0 && { images: images }),
             ...(uploadedFiles && { files: uploadedFiles }),
         };
+
+        // Reset the flag after using it
+        setShouldSendWithInterrupt(false);
 
         const response = await fetch(chatAPI, {
             method: "POST",
@@ -411,6 +422,36 @@ export default function Chat() {
 
     const handleConversationIdChange = (newConversationId: string) => {
         setConversationID(newConversationId);
+    };
+
+    const handleRetryMessage = (query: string, turnId?: string) => {
+        if (!query) {
+            console.warn("No query provided for retry");
+            return;
+        }
+
+        // If we have a turnId, delete the old turn first
+        if (turnId) {
+            // Delete from streaming messages if present
+            setMessages((prevMessages) => prevMessages.filter((msg) => msg.turnId !== turnId));
+
+            // Also call the delete API to remove from conversation history
+            fetch("/api/chat/conversation/message", {
+                method: "DELETE",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    conversation_id: conversationId,
+                    turn_id: turnId,
+                }),
+            }).catch((error) => {
+                console.error("Failed to delete message for retry:", error);
+            });
+        }
+
+        // Re-send the original query
+        setQueryToProcess(query);
     };
 
     if (isLoading) return <Loading />;
@@ -480,12 +521,15 @@ export default function Chat() {
                                     setTriggeredAbort={setTriggeredAbort}
                                     isChatSideBarOpen={isChatSideBarOpen}
                                     setIsChatSideBarOpen={setIsChatSideBarOpen}
+                                    isActive={authenticatedData?.is_active}
+                                    isParentProcessing={processQuerySignal}
+                                    onRetryMessage={handleRetryMessage}
                                 />
                             </Suspense>
                         </div>
                     </div>
                 </div>
             </SidebarInset>
-        </SidebarProvider >
+        </SidebarProvider>
     );
 }

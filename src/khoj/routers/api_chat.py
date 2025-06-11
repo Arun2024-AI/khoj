@@ -25,8 +25,14 @@ from khoj.database.adapters import (
 from khoj.database.models import Agent, KhojUser
 from khoj.processor.conversation import prompts
 from khoj.processor.conversation.prompts import help_message, no_entries_found
-from khoj.processor.conversation.utils import defilter_query, save_to_conversation_log
+from khoj.processor.conversation.utils import (
+    OperatorRun,
+    ResponseWithThought,
+    defilter_query,
+    save_to_conversation_log,
+)
 from khoj.processor.image.generate import text_to_image
+from khoj.processor.operator import operate_environment
 from khoj.processor.speech.text_to_speech import generate_text_to_speech
 from khoj.processor.tools.online_search import (
     deduplicate_organic_results,
@@ -34,7 +40,6 @@ from khoj.processor.tools.online_search import (
     search_online,
 )
 from khoj.processor.tools.run_code import run_code
-from khoj.routers.api import extract_references_and_questions
 from khoj.routers.email import send_query_feedback
 from khoj.routers.helpers import (
     ApiImageRateLimiter,
@@ -57,24 +62,23 @@ from khoj.routers.helpers import (
     is_query_empty,
     is_ready_to_chat,
     read_chat_stream,
+    search_documents,
     update_telemetry_state,
     validate_chat_model,
 )
-from khoj.routers.research import (
-    InformationCollectionIteration,
-    execute_information_collection,
-)
+from khoj.routers.research import ResearchIteration, research
 from khoj.routers.storage import upload_user_image_to_bucket
 from khoj.utils import state
 from khoj.utils.helpers import (
-    AsyncIteratorWrapper,
     ConversationCommand,
+    clean_text_for_db,
     command_descriptions,
     convert_image_to_webp,
     get_country_code_from_timezone,
     get_country_name_from_timezone,
     get_device,
     is_none_or_empty,
+    is_operator_enabled,
 )
 from khoj.utils.rawconfig import (
     ChatRequestBody,
@@ -566,6 +570,8 @@ async def chat_options(
 ) -> Response:
     cmd_options = {}
     for cmd in ConversationCommand:
+        if cmd == ConversationCommand.Operator and not is_operator_enabled():
+            continue
         if cmd in command_descriptions:
             cmd_options[cmd.value] = command_descriptions[cmd]
 
@@ -626,7 +632,7 @@ async def generate_chat_title(
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     new_title = await acreate_title_from_history(request.user.object, conversation=conversation)
-    conversation.slug = new_title[:200]
+    conversation.slug = clean_text_for_db(new_title[:200])
 
     await conversation.asave()
 
@@ -675,19 +681,20 @@ async def chat(
     timezone = body.timezone
     raw_images = body.images
     raw_query_files = body.files
+    interrupt_flag = body.interrupt
 
     async def event_generator(q: str, images: list[str]):
         start_time = time.perf_counter()
         ttft = None
         chat_metadata: dict = {}
-        connection_alive = True
+        conversation = None
         user: KhojUser = request.user.object
         is_subscribed = has_required_scope(request, ["premium"])
-        event_delimiter = "␃🔚␗"
         q = unquote(q)
         train_of_thought = []
         nonlocal conversation_id
         nonlocal raw_query_files
+        cancellation_event = asyncio.Event()
 
         tracer: dict = {
             "mid": turn_id,
@@ -714,11 +721,72 @@ async def chat(
             for file in raw_query_files:
                 query_files[file.name] = file.content
 
+        research_results: List[ResearchIteration] = []
+        online_results: Dict = dict()
+        code_results: Dict = dict()
+        operator_results: List[OperatorRun] = []
+        compiled_references: List[Any] = []
+        inferred_queries: List[Any] = []
+        attached_file_context = gather_raw_query_files(query_files)
+
+        generated_images: List[str] = []
+        generated_files: List[FileAttachment] = []
+        generated_mermaidjs_diagram: str = None
+        generated_asset_results: Dict = dict()
+        program_execution_context: List[str] = []
+
+        # Create a task to monitor for disconnections
+        disconnect_monitor_task = None
+
+        async def monitor_disconnection():
+            try:
+                msg = await request.receive()
+                if msg["type"] == "http.disconnect":
+                    logger.debug(f"Request cancelled. User {user} disconnected from {common.client} client.")
+                    cancellation_event.set()
+                    # ensure partial chat state saved on interrupt
+                    # shield the save against task cancellation
+                    if conversation:
+                        await asyncio.shield(
+                            save_to_conversation_log(
+                                q,
+                                chat_response="",
+                                user=user,
+                                chat_history=chat_history,
+                                compiled_references=compiled_references,
+                                online_results=online_results,
+                                code_results=code_results,
+                                operator_results=operator_results,
+                                research_results=research_results,
+                                inferred_queries=inferred_queries,
+                                client_application=request.user.client_app,
+                                conversation_id=conversation_id,
+                                query_images=uploaded_images,
+                                train_of_thought=train_of_thought,
+                                raw_query_files=raw_query_files,
+                                generated_images=generated_images,
+                                raw_generated_files=generated_asset_results,
+                                generated_mermaidjs_diagram=generated_mermaidjs_diagram,
+                                tracer=tracer,
+                            )
+                        )
+            except Exception as e:
+                logger.error(f"Error in disconnect monitor: {e}")
+
+        # Cancel the disconnect monitor task if it is still running
+        async def cancel_disconnect_monitor():
+            if disconnect_monitor_task and not disconnect_monitor_task.done():
+                logger.debug(f"Cancelling disconnect monitor task for user {user}")
+                disconnect_monitor_task.cancel()
+                try:
+                    await disconnect_monitor_task
+                except asyncio.CancelledError:
+                    pass
+
         async def send_event(event_type: ChatEvent, data: str | dict):
-            nonlocal connection_alive, ttft, train_of_thought
-            if not connection_alive or await request.is_disconnected():
-                connection_alive = False
-                logger.warning(f"User {user} disconnected from {common.client} client")
+            nonlocal ttft, train_of_thought
+            event_delimiter = "␃🔚␗"
+            if cancellation_event.is_set():
                 return
             try:
                 if event_type == ChatEvent.END_LLM_RESPONSE:
@@ -727,23 +795,38 @@ async def chat(
                     ttft = time.perf_counter() - start_time
                 elif event_type == ChatEvent.STATUS:
                     train_of_thought.append({"type": event_type.value, "data": data})
+                elif event_type == ChatEvent.THOUGHT:
+                    # Append the data to the last thought as thoughts are streamed
+                    if (
+                        len(train_of_thought) > 0
+                        and train_of_thought[-1]["type"] == ChatEvent.THOUGHT.value
+                        and type(train_of_thought[-1]["data"]) == type(data) == str
+                    ):
+                        train_of_thought[-1]["data"] += data
+                    else:
+                        train_of_thought.append({"type": event_type.value, "data": data})
 
                 if event_type == ChatEvent.MESSAGE:
                     yield data
                 elif event_type == ChatEvent.REFERENCES or ChatEvent.METADATA or stream:
                     yield json.dumps({"type": event_type.value, "data": data}, ensure_ascii=False)
-            except asyncio.CancelledError as e:
-                connection_alive = False
-                logger.warn(f"User {user} disconnected from {common.client} client: {e}")
-                return
             except Exception as e:
-                connection_alive = False
-                logger.error(f"Failed to stream chat API response to {user} on {common.client}: {e}", exc_info=True)
-                return
+                if not cancellation_event.is_set():
+                    logger.error(
+                        f"Failed to stream chat API response to {user} on {common.client}: {e}.",
+                        exc_info=True,
+                    )
             finally:
-                yield event_delimiter
+                if not cancellation_event.is_set():
+                    yield event_delimiter
+                # Cancel the disconnect monitor task if it is still running
+                if cancellation_event.is_set() or event_type == ChatEvent.END_RESPONSE:
+                    await cancel_disconnect_monitor()
 
         async def send_llm_response(response: str, usage: dict = None):
+            # Check if the client is still connected
+            if cancellation_event.is_set():
+                return
             # Send Chat Response
             async for result in send_event(ChatEvent.START_LLM_RESPONSE, ""):
                 yield result
@@ -767,11 +850,11 @@ async def chat(
             chat_metadata = chat_metadata or {}
             chat_metadata["conversation_command"] = cmd_set
             chat_metadata["agent"] = conversation.agent.slug if conversation and conversation.agent else None
-            chat_metadata["latency"] = f"{latency:.3f}"
-            chat_metadata["ttft_latency"] = f"{ttft:.3f}"
             chat_metadata["cost"] = f"{cost:.5f}"
-
-            logger.info(f"Chat response time to first token: {ttft:.3f} seconds")
+            chat_metadata["latency"] = f"{latency:.3f}"
+            if ttft:
+                chat_metadata["ttft_latency"] = f"{ttft:.3f}"
+                logger.info(f"Chat response time to first token: {ttft:.3f} seconds")
             logger.info(f"Chat response total time: {latency:.3f} seconds")
             logger.info(f"Chat response cost: ${cost:.5f}")
             update_telemetry_state(
@@ -783,6 +866,9 @@ async def chat(
                 host=request.headers.get("host"),
                 metadata=chat_metadata,
             )
+
+        # Start the disconnect monitor in the background
+        disconnect_monitor_task = asyncio.create_task(monitor_disconnection())
 
         if is_query_empty(q):
             async for result in send_llm_response("Please ask your query to get started.", tracer.get("usage")):
@@ -811,9 +897,9 @@ async def chat(
             async for result in send_llm_response(f"Conversation {conversation_id} not found", tracer.get("usage")):
                 yield result
             return
-        conversation_id = conversation.id
+        conversation_id = str(conversation.id)
 
-        async for event in send_event(ChatEvent.METADATA, {"conversationId": str(conversation_id), "turnId": turn_id}):
+        async for event in send_event(ChatEvent.METADATA, {"conversationId": conversation_id, "turnId": turn_id}):
             yield event
 
         agent: Agent | None = None
@@ -832,28 +918,64 @@ async def chat(
         if city or region or country or country_code:
             location = LocationData(city=city, region=region, country=country, country_code=country_code)
         user_message_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        meta_log = conversation.conversation_log
+        chat_history = conversation.messages
 
-        researched_results = ""
-        online_results: Dict = dict()
-        code_results: Dict = dict()
-        generated_asset_results: Dict = dict()
-        ## Extract Document References
-        compiled_references: List[Any] = []
-        inferred_queries: List[Any] = []
-        file_filters = conversation.file_filters if conversation and conversation.file_filters else []
-        attached_file_context = gather_raw_query_files(query_files)
+        # If interrupt flag is set, wait for the previous turn to be saved before proceeding
+        if interrupt_flag:
+            max_wait_time = 20.0  # seconds
+            wait_interval = 0.3  # seconds
+            wait_start = wait_current = time.time()
+            while wait_current - wait_start < max_wait_time:
+                # Refresh conversation to check if interrupted message saved to DB
+                conversation = await ConversationAdapters.aget_conversation_by_user(
+                    user,
+                    client_application=request.user.client_app,
+                    conversation_id=conversation_id,
+                )
+                if (
+                    conversation
+                    and conversation.messages
+                    and conversation.messages[-1].by == "khoj"
+                    and not conversation.messages[-1].message
+                ):
+                    logger.info(f"Detected interrupted message save to conversation {conversation_id}.")
+                    break
+                await asyncio.sleep(wait_interval)
+                wait_current = time.time()
 
-        generated_images: List[str] = []
-        generated_files: List[FileAttachment] = []
-        generated_mermaidjs_diagram: str = None
-        program_execution_context: List[str] = []
+            if wait_current - wait_start >= max_wait_time:
+                logger.warning(
+                    f"Timeout waiting to load interrupted context from conversation {conversation_id}. Proceed without previous context."
+                )
+
+        # If interrupted message in DB
+        if (
+            conversation
+            and conversation.messages
+            and conversation.messages[-1].by == "khoj"
+            and not conversation.messages[-1].message
+        ):
+            # Populate context from interrupted message
+            last_message = conversation.messages[-1]
+            online_results = {key: val.model_dump() for key, val in last_message.onlineContext.items() or []}
+            code_results = {key: val.model_dump() for key, val in last_message.codeContext.items() or []}
+            compiled_references = [ref.model_dump() for ref in last_message.context or []]
+            research_results = [
+                ResearchIteration(**iter_dict)
+                for iter_dict in last_message.researchContext or []
+                if iter_dict.get("summarizedResult")
+            ]
+            operator_results = [OperatorRun(**iter_dict) for iter_dict in last_message.operatorContext or []]
+            train_of_thought = [thought.model_dump() for thought in last_message.trainOfThought or []]
+            # Drop the interrupted message from conversation history
+            chat_history.pop()
+            logger.info(f"Loaded interrupted partial context from conversation {conversation_id}.")
 
         if conversation_commands == [ConversationCommand.Default]:
             try:
                 chosen_io = await aget_data_sources_and_output_format(
                     q,
-                    meta_log,
+                    chat_history,
                     is_automated_task,
                     user=user,
                     query_images=uploaded_images,
@@ -886,24 +1008,26 @@ async def chat(
                 return
 
         defiltered_query = defilter_query(q)
+        file_filters = conversation.file_filters if conversation and conversation.file_filters else []
 
         if conversation_commands == [ConversationCommand.Research]:
-            async for research_result in execute_information_collection(
-                request=request,
+            async for research_result in research(
                 user=user,
                 query=defiltered_query,
                 conversation_id=conversation_id,
-                conversation_history=meta_log,
+                conversation_history=chat_history,
+                previous_iterations=list(research_results),
                 query_images=uploaded_images,
                 agent=agent,
                 send_status_func=partial(send_event, ChatEvent.STATUS),
                 user_name=user_name,
                 location=location,
-                file_filters=conversation.file_filters if conversation else [],
+                file_filters=file_filters,
                 query_files=attached_file_context,
                 tracer=tracer,
+                cancellation_event=cancellation_event,
             ):
-                if isinstance(research_result, InformationCollectionIteration):
+                if isinstance(research_result, ResearchIteration):
                     if research_result.summarizedResult:
                         if research_result.onlineContext:
                             online_results.update(research_result.onlineContext)
@@ -911,122 +1035,37 @@ async def chat(
                             code_results.update(research_result.codeContext)
                         if research_result.context:
                             compiled_references.extend(research_result.context)
-
-                        researched_results += research_result.summarizedResult
-
+                    if not research_results or research_results[-1] is not research_result:
+                        research_results.append(research_result)
                 else:
                     yield research_result
 
+                # Track operator results across research and operator iterations
+                # This relies on two conditions:
+                # 1. Check to append new (partial) operator results
+                #    Relies on triggering this check on every status updates.
+                #    Status updates cascade up from operator to research to chat api on every step.
+                # 2. Keep operator results in sync with each research operator step
+                #    Relies on python object references to ensure operator results
+                #    are implicitly kept in sync after the initial append
+                if (
+                    research_results
+                    and research_results[-1].operatorContext
+                    and (not operator_results or operator_results[-1] is not research_results[-1].operatorContext)
+                ):
+                    operator_results.append(research_results[-1].operatorContext)
+
             # researched_results = await extract_relevant_info(q, researched_results, agent)
             if state.verbose > 1:
-                logger.debug(f"Researched Results: {researched_results}")
-
-        used_slash_summarize = conversation_commands == [ConversationCommand.Summarize]
-        file_filters = conversation.file_filters if conversation else []
-        # Skip trying to summarize if
-        if (
-            # summarization intent was inferred
-            ConversationCommand.Summarize in conversation_commands
-            # and not triggered via slash command
-            and not used_slash_summarize
-            # but we can't actually summarize
-            and len(file_filters) == 0
-        ):
-            conversation_commands.remove(ConversationCommand.Summarize)
-        elif ConversationCommand.Summarize in conversation_commands:
-            response_log = ""
-            agent_has_entries = await EntryAdapters.aagent_has_entries(agent)
-            if len(file_filters) == 0 and not agent_has_entries:
-                response_log = "No files selected for summarization. Please add files using the section on the left."
-                async for result in send_llm_response(response_log, tracer.get("usage")):
-                    yield result
-            else:
-                async for response in generate_summary_from_files(
-                    q=q,
-                    user=user,
-                    file_filters=file_filters,
-                    meta_log=meta_log,
-                    query_images=uploaded_images,
-                    agent=agent,
-                    send_status_func=partial(send_event, ChatEvent.STATUS),
-                    query_files=attached_file_context,
-                    tracer=tracer,
-                ):
-                    if isinstance(response, dict) and ChatEvent.STATUS in response:
-                        yield response[ChatEvent.STATUS]
-                    else:
-                        if isinstance(response, str):
-                            response_log = response
-                            async for result in send_llm_response(response, tracer.get("usage")):
-                                yield result
-
-            summarized_document = FileAttachment(
-                name="Summarized Document",
-                content=response_log,
-                type="text/plain",
-                size=len(response_log.encode("utf-8")),
-            )
-
-            async for result in send_event(ChatEvent.GENERATED_ASSETS, {"files": [summarized_document.model_dump()]}):
-                yield result
-
-            generated_files.append(summarized_document)
-
-        custom_filters = []
-        if conversation_commands == [ConversationCommand.Help]:
-            if not q:
-                chat_model = await ConversationAdapters.aget_user_chat_model(user)
-                if chat_model == None:
-                    chat_model = await ConversationAdapters.aget_default_chat_model(user)
-                model_type = chat_model.model_type
-                formatted_help = help_message.format(model=model_type, version=state.khoj_version, device=get_device())
-                async for result in send_llm_response(formatted_help, tracer.get("usage")):
-                    yield result
-                return
-            # Adding specification to search online specifically on khoj.dev pages.
-            custom_filters.append("site:khoj.dev")
-            conversation_commands.append(ConversationCommand.Online)
-
-        if ConversationCommand.Automation in conversation_commands:
-            try:
-                automation, crontime, query_to_run, subject = await create_automation(
-                    q, timezone, user, request.url, meta_log, tracer=tracer
-                )
-            except Exception as e:
-                logger.error(f"Error scheduling task {q} for {user.email}: {e}")
-                error_message = f"Unable to create automation. Ensure the automation doesn't already exist."
-                async for result in send_llm_response(error_message, tracer.get("usage")):
-                    yield result
-                return
-
-            llm_response = construct_automation_created_message(automation, crontime, query_to_run, subject)
-            await sync_to_async(save_to_conversation_log)(
-                q,
-                llm_response,
-                user,
-                meta_log,
-                user_message_time,
-                intent_type="automation",
-                client_application=request.user.client_app,
-                conversation_id=conversation_id,
-                inferred_queries=[query_to_run],
-                automation_id=automation.id,
-                query_images=uploaded_images,
-                train_of_thought=train_of_thought,
-                raw_query_files=raw_query_files,
-                tracer=tracer,
-            )
-            async for result in send_llm_response(llm_response, tracer.get("usage")):
-                yield result
-            return
+                logger.debug(f'Researched Results: {"".join(r.summarizedResult for r in research_results)}')
 
         # Gather Context
         ## Extract Document References
         if not ConversationCommand.Research in conversation_commands:
             try:
-                async for result in extract_references_and_questions(
-                    request,
-                    meta_log,
+                async for result in search_documents(
+                    user,
+                    chat_history,
                     q,
                     (n or 7),
                     d,
@@ -1075,14 +1114,15 @@ async def chat(
             try:
                 async for result in search_online(
                     defiltered_query,
-                    meta_log,
+                    chat_history,
                     location,
                     user,
                     partial(send_event, ChatEvent.STATUS),
-                    custom_filters,
+                    custom_filters=[],
+                    max_online_searches=3,
                     query_images=uploaded_images,
-                    agent=agent,
                     query_files=attached_file_context,
+                    agent=agent,
                     tracer=tracer,
                 ):
                     if isinstance(result, dict) and ChatEvent.STATUS in result:
@@ -1102,7 +1142,7 @@ async def chat(
             try:
                 async for result in read_webpages(
                     defiltered_query,
-                    meta_log,
+                    chat_history,
                     location,
                     user,
                     partial(send_event, ChatEvent.STATUS),
@@ -1143,7 +1183,7 @@ async def chat(
                 context = f"# Iteration 1:\n#---\nNotes:\n{compiled_references}\n\nOnline Results:{online_results}"
                 async for result in run_code(
                     defiltered_query,
-                    meta_log,
+                    chat_history,
                     context,
                     location,
                     user,
@@ -1157,14 +1197,47 @@ async def chat(
                         yield result[ChatEvent.STATUS]
                     else:
                         code_results = result
-                async for result in send_event(ChatEvent.STATUS, f"**Ran code snippets**: {len(code_results)}"):
-                    yield result
             except ValueError as e:
                 program_execution_context.append(f"Failed to run code")
                 logger.warning(
                     f"Failed to use code tool: {e}. Attempting to respond without code results",
                     exc_info=True,
                 )
+        if ConversationCommand.Operator in conversation_commands:
+            try:
+                async for result in operate_environment(
+                    defiltered_query,
+                    user,
+                    chat_history,
+                    location,
+                    list(operator_results)[-1] if operator_results else None,
+                    query_images=uploaded_images,
+                    query_files=attached_file_context,
+                    send_status_func=partial(send_event, ChatEvent.STATUS),
+                    agent=agent,
+                    cancellation_event=cancellation_event,
+                    tracer=tracer,
+                ):
+                    if isinstance(result, dict) and ChatEvent.STATUS in result:
+                        yield result[ChatEvent.STATUS]
+                    elif isinstance(result, OperatorRun):
+                        if not operator_results or operator_results[-1] is not result:
+                            operator_results.append(result)
+                        # Add webpages visited while operating browser to references
+                        if result.webpages:
+                            if not online_results.get(defiltered_query):
+                                online_results[defiltered_query] = {"webpages": result.webpages}
+                            elif not online_results[defiltered_query].get("webpages"):
+                                online_results[defiltered_query]["webpages"] = result.webpages
+                            else:
+                                online_results[defiltered_query]["webpages"] += result.webpages
+            except ValueError as e:
+                program_execution_context.append(f"Browser operation error: {e}")
+                logger.warning(f"Failed to operate browser with {e}", exc_info=True)
+                async for result in send_event(
+                    ChatEvent.STATUS, "Operating browser failed. I'll try respond appropriately"
+                ):
+                    yield result
 
         ## Send Gathered References
         unique_online_results = deduplicate_organic_results(online_results)
@@ -1185,7 +1258,7 @@ async def chat(
             async for result in text_to_image(
                 defiltered_query,
                 user,
-                meta_log,
+                chat_history,
                 location_data=location,
                 references=compiled_references,
                 online_results=online_results,
@@ -1229,7 +1302,7 @@ async def chat(
 
             async for result in generate_mermaidjs_diagram(
                 q=defiltered_query,
-                conversation_history=meta_log,
+                chat_history=chat_history,
                 location_data=location,
                 note_references=compiled_references,
                 online_results=online_results,
@@ -1272,63 +1345,104 @@ async def chat(
                         async for result in send_event(ChatEvent.STATUS, error_message):
                             yield result
 
+        # Check if the user has disconnected
+        if cancellation_event.is_set():
+            logger.debug(f"Stopping LLM response to user {user} on {common.client} client.")
+            # Cancel the disconnect monitor task if it is still running
+            await cancel_disconnect_monitor()
+            return
+
         ## Generate Text Output
         async for result in send_event(ChatEvent.STATUS, f"**Generating a well-informed response**"):
             yield result
 
         llm_response, chat_metadata = await agenerate_chat_response(
             defiltered_query,
-            meta_log,
+            chat_history,
             conversation,
             compiled_references,
             online_results,
             code_results,
-            inferred_queries,
-            conversation_commands,
+            operator_results,
+            research_results,
             user,
-            request.user.client_app,
-            conversation_id,
             location,
             user_name,
-            researched_results,
             uploaded_images,
-            train_of_thought,
             attached_file_context,
-            raw_query_files,
-            generated_images,
             generated_files,
-            generated_mermaidjs_diagram,
             program_execution_context,
             generated_asset_results,
             is_subscribed,
             tracer,
         )
 
-        # Send Response
-        async for result in send_event(ChatEvent.START_LLM_RESPONSE, ""):
-            yield result
-
-        continue_stream = True
-        iterator = AsyncIteratorWrapper(llm_response)
-        async for item in iterator:
-            if item is None:
-                async for result in send_event(ChatEvent.END_LLM_RESPONSE, ""):
-                    yield result
-                # Send Usage Metadata once llm interactions are complete
-                async for event in send_event(ChatEvent.USAGE, tracer.get("usage")):
-                    yield event
-                async for result in send_event(ChatEvent.END_RESPONSE, ""):
-                    yield result
-                logger.debug("Finished streaming response")
-                return
-            if not connection_alive or not continue_stream:
+        full_response = ""
+        async for item in llm_response:
+            # Should not happen with async generator. Skip.
+            if item is None or not isinstance(item, ResponseWithThought):
+                logger.warning(f"Unexpected item type in LLM response: {type(item)}. Skipping.")
                 continue
+            if cancellation_event.is_set():
+                break
+            message = item.response
+            full_response += message if message else ""
+            if item.thought:
+                async for result in send_event(ChatEvent.THOUGHT, item.thought):
+                    yield result
+                continue
+
+            # Start sending response
+            async for result in send_event(ChatEvent.START_LLM_RESPONSE, ""):
+                yield result
+
             try:
-                async for result in send_event(ChatEvent.MESSAGE, f"{item}"):
+                async for result in send_event(ChatEvent.MESSAGE, message):
                     yield result
             except Exception as e:
-                continue_stream = False
-                logger.info(f"User {user} disconnected. Emitting rest of responses to clear thread: {e}")
+                if not cancellation_event.is_set():
+                    logger.warning(f"Error during streaming. Stopping send: {e}")
+                break
+
+        # Save conversation once finish streaming
+        asyncio.create_task(
+            save_to_conversation_log(
+                q,
+                chat_response=full_response,
+                user=user,
+                chat_history=chat_history,
+                compiled_references=compiled_references,
+                online_results=online_results,
+                code_results=code_results,
+                operator_results=operator_results,
+                research_results=research_results,
+                inferred_queries=inferred_queries,
+                client_application=request.user.client_app,
+                conversation_id=str(conversation.id),
+                query_images=uploaded_images,
+                train_of_thought=train_of_thought,
+                raw_query_files=raw_query_files,
+                generated_images=generated_images,
+                raw_generated_files=generated_files,
+                generated_mermaidjs_diagram=generated_mermaidjs_diagram,
+                tracer=tracer,
+            )
+        )
+
+        # Signal end of LLM response after the loop finishes
+        if not cancellation_event.is_set():
+            async for result in send_event(ChatEvent.END_LLM_RESPONSE, ""):
+                yield result
+            # Send Usage Metadata once llm interactions are complete
+            if tracer.get("usage"):
+                async for event in send_event(ChatEvent.USAGE, tracer.get("usage")):
+                    yield event
+            async for result in send_event(ChatEvent.END_RESPONSE, ""):
+                yield result
+            logger.debug("Finished streaming response")
+
+        # Cancel the disconnect monitor task if it is still running
+        await cancel_disconnect_monitor()
 
     ## Stream Text Response
     if stream:
